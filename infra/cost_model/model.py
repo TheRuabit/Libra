@@ -145,7 +145,8 @@ class RolloutCostModel:
         s_token_kv = self.compute_token_kv_bytes(tp)
         if s_token_kv <= 0:
             return 0
-        raw_capacity = kv_pool / s_token_kv
+        # The pool spans all TP ranks; token KV bytes are per rank.
+        raw_capacity = kv_pool / (tp * s_token_kv)
         return int(raw_capacity * (1.0 - self.kv_frag_rate))
 
     # ========================================================================
