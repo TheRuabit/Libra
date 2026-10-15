@@ -6,10 +6,16 @@ import asyncio
 import hashlib
 import os
 import random
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
-from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+from RL_Framework.env.r2e_patch_harness import (
+    R2EPatchExecutionHarness,
+    R2ESingularityPatchHarness,
+)
 
 from RL_Framework.env.r2e_gym_reward import (
     evaluate_issue,
@@ -44,6 +50,7 @@ class R2EGymWorkflow:
         temperature: float = 1.0,
         top_p: float = 1.0,
         n_samples: int = 1,
+        patch_harness: R2EPatchExecutionHarness | R2ESingularityPatchHarness | None = None,
     ):
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
@@ -59,6 +66,7 @@ class R2EGymWorkflow:
         self.temperature = temperature
         self.top_p = top_p
         self.n_samples = n_samples
+        self.patch_harness = patch_harness
 
     def _encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text or "", add_special_tokens=False)
@@ -120,13 +128,42 @@ class R2EGymWorkflow:
         return tokens[:remaining], logprobs[:remaining]
 
     def _build_initial_prompt(self, row: dict[str, Any]) -> str:
-        task_prompt = row.get("prompt") or row.get("problem_statement") or row.get("task_text") or ""
+        task_prompt = (
+            row.get("problem_statement") or row.get("task_text") or ""
+            if self.patch_harness
+            else row.get("prompt") or row.get("problem_statement") or row.get("task_text") or ""
+        )
         task_prompt = self._truncate_text_to_tokens(task_prompt, self.max_prompt_tokens)
+        system_prompt = (
+            "Return only a unified git diff that fixes the reported issue. "
+            "Start with diff --git. Do not use markdown fences."
+            if self.patch_harness else SYSTEM_PROMPT
+        )
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": task_prompt},
         ]
         return self._apply_chat_template(messages)
+
+    async def _score(self, completion: str, row: dict[str, Any]) -> dict[str, Any]:
+        if self.patch_harness:
+            required = ["test_command", "docker_image"]
+            if self.patch_harness.requires_repo_path:
+                required.extend(("repo_path", "commit_hash"))
+            missing = [key for key in required if not row.get(key)]
+            if missing:
+                raise ValueError(f"R2E patch mode missing task fields: {missing}")
+            execution = await asyncio.to_thread(
+                self.patch_harness.execute, completion, row.get("repo_path"),
+                row["test_command"], row["docker_image"], row.get("commit_hash", ""),
+            )
+            return {"reward": float(execution["tests_passed"]), "execution": execution}
+        return evaluate_issue(
+            completion=completion,
+            target_issue=row.get("target_issue", row.get("task_text", "")),
+            expected_output_json=row.get("expected_output_json"),
+            modified_files=row.get("modified_files"),
+        )
 
     async def run_episode(
         self,
@@ -171,15 +208,16 @@ class R2EGymWorkflow:
                     reserve_feedback_tokens=128 if turn < self.max_turns - 1 else 0,
                 )
                 generate_kwargs = {
+                    "prompt_id": prompt_id,
                     "prompt": generation_prompt,
                     "max_new_tokens": max_tokens_this_turn,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "n": 1,
-                    # The output contract has an explicit closing delimiter.
-                    # Stopping there prevents repetitive tails from consuming
-                    # the remaining 30K generation budget.
-                    "stop": ["[/ISSUE]"],
+                    # Exact count from the fitter; skips engine estimation.
+                    "input_tokens": generation_prompt_tokens,
+                    # Issue generation has an explicit closing delimiter.
+                    "stop": [] if self.patch_harness else ["[/ISSUE]"],
                     "include_stop_str_in_output": True,
                     "seed": int.from_bytes(
                         hashlib.sha256(
@@ -210,16 +248,14 @@ class R2EGymWorkflow:
                 if output_tokens:
                     segments.append((output_tokens, output_logprobs, 1))
 
-                metrics = evaluate_issue(
-                    completion=output_text,
-                    target_issue=data.get("target_issue", data.get("task_text", "")),
-                    expected_output_json=data.get("expected_output_json"),
-                    modified_files=data.get("modified_files"),
-                )
+                metrics = await self._score(output_text, data)
                 if turn >= self.max_turns - 1 or metrics["reward"] >= self.stop_reward:
                     break
 
-                feedback = format_validator_feedback(metrics)
+                feedback = (
+                    f"### Patch execution\n{metrics['execution']}\nRevise the patch."
+                    if self.patch_harness else format_validator_feedback(metrics)
+                )
                 feedback_tokens = self._encode(feedback)
                 used_after_output = sum(len(tokens) for tokens, _, _ in segments)
                 feedback_tokens, feedback_logprobs = self._clip_tokens_to_sequence_budget(
@@ -233,7 +269,7 @@ class R2EGymWorkflow:
                 segments.append((feedback_tokens, feedback_logprobs, 0))
                 generated_tokens = sum(len(tokens) for tokens, _, _ in segments[1:])
                 tool_event = {
-                    "tool_type": "r2e_issue_validator",
+                    "tool_type": "r2e_patch_executor" if self.patch_harness else "r2e_issue_validator",
                     "output": feedback,
                     "status": "success" if metrics["reward"] >= self.stop_reward else "failure",
                     "payload_tokens": len(feedback_tokens),
@@ -248,7 +284,10 @@ class R2EGymWorkflow:
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
 
                 current_text += output_text + "\n" + feedback + "\n"
-        except Exception:
+        except BaseException:
+            # BaseException: CancelledError (task cancellation) must also
+            # release the C-MLFQ request state, otherwise the leaked entry
+            # wedges wait_until_idle until timeout.
             cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
             if cmlfq_request_id and callable(cancel_cmlfq):
                 cancel_cmlfq(cmlfq_request_id)
@@ -278,7 +317,7 @@ class R2EGymWorkflow:
             finish_cmlfq(cmlfq_request_id, total_output_tokens)
 
         full_completion = self.tokenizer.decode(all_input_ids, skip_special_tokens=True)
-        reward = self.reward_fn(
+        reward = metrics["reward"] if self.patch_harness else self.reward_fn(
             prompt=prompt_text,
             completion=final_completion or full_completion,
             target_issue=data.get("target_issue", data.get("task_text", "")),
@@ -380,7 +419,8 @@ class R2EGymWorkflow:
                             "top_p": 1.0,
                             "n": 1,
                             "prompt_id": prompt_id,
-                            "stop": ["[/ISSUE]"],
+                            "input_tokens": prompt_len,
+                            "stop": [] if self.patch_harness else ["[/ISSUE]"],
                             "include_stop_str_in_output": True,
                         }
                         if request_id:
@@ -388,12 +428,7 @@ class R2EGymWorkflow:
                         response = await engine.generate(**generate_kwargs)
                         completion = response.get("text", "")
                         generated_tokens += len(self._encode(completion))
-                        metrics = evaluate_issue(
-                            completion=completion,
-                            target_issue=row.get("target_issue", row.get("task_text", "")),
-                            expected_output_json=row.get("expected_output_json"),
-                            modified_files=row.get("modified_files"),
-                        )
+                        metrics = await self._score(completion, row)
                         turn_metrics.append(metrics)
                         if (
                             not use_feedback
@@ -401,7 +436,10 @@ class R2EGymWorkflow:
                             or metrics["reward"] >= self.stop_reward
                         ):
                             break
-                        feedback = format_validator_feedback(metrics)
+                        feedback = (
+                            f"### Patch execution\n{metrics['execution']}\nRevise the patch."
+                            if self.patch_harness else format_validator_feedback(metrics)
+                        )
                         feedback_tokens = len(self._encode(feedback))
                         generated_tokens += feedback_tokens
                         route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
@@ -409,7 +447,7 @@ class R2EGymWorkflow:
                             route_tool_return(
                                 request_id,
                                 {
-                                    "tool_type": "r2e_issue_validator",
+                                    "tool_type": "r2e_patch_executor" if self.patch_harness else "r2e_issue_validator",
                                     "output": feedback,
                                     "status": (
                                         "success"
@@ -427,12 +465,7 @@ class R2EGymWorkflow:
                     finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
                     if request_id and callable(finish_cmlfq):
                         finish_cmlfq(request_id, generated_tokens)
-                    metrics = evaluate_issue(
-                        completion=completion,
-                        target_issue=row.get("target_issue", row.get("task_text", "")),
-                        expected_output_json=row.get("expected_output_json"),
-                        modified_files=row.get("modified_files"),
-                    )
+                    metrics = turn_metrics[-1] if turn_metrics else await self._score(completion, row)
                     return {
                         "ok": True,
                         "index": int(index),
@@ -444,6 +477,13 @@ class R2EGymWorkflow:
                         "metrics": metrics,
                         "turn_metrics": turn_metrics,
                     }
+                except asyncio.CancelledError:
+                    # Task cancellation must propagate, not be converted
+                    # into a (false) evaluation result row.
+                    cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
+                    if request_id and callable(cancel_cmlfq):
+                        cancel_cmlfq(request_id)
+                    raise
                 except Exception as exc:
                     cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
                     if request_id and callable(cancel_cmlfq):
@@ -461,11 +501,20 @@ class R2EGymWorkflow:
         rewards = [r["reward"] for r in results]
         accurate = [r["accurate"] for r in results]
         failures = [r for r in results if not r["ok"]]
+        dense_metric_keys = (
+            "lexical_f1",
+            "test_coverage",
+            "file_coverage",
+            "format_score",
+        )
         stats = {
             "eval_samples": n_eval,
             "eval_total_rows": n_total,
             "eval_index_strategy": eval_strategy,
             "eval_indices": eval_indices,
+            "eval_index_digest": hashlib.sha256(
+                ",".join(str(index) for index in eval_indices).encode("utf-8")
+            ).hexdigest(),
             "eval_accuracy": sum(accurate) / max(1, len(accurate)),
             "eval_accuracy_threshold": float(accuracy_threshold),
             "eval_reward_ge_0_3": sum(float(r >= 0.3) for r in rewards) / max(1, len(rewards)),
@@ -478,6 +527,11 @@ class R2EGymWorkflow:
             "eval_first_error": failures[0].get("error", "") if failures else "",
             "eval_mode": "multi_turn" if use_feedback else "single_turn",
         }
+        for metric_key in dense_metric_keys:
+            stats[f"eval_{metric_key}"] = sum(
+                float(result.get("metrics", {}).get(metric_key, 0.0))
+                for result in results
+            ) / max(1, len(results))
         if record_limit:
             stats["eval_records"] = results[:record_limit]
         return stats
