@@ -15,6 +15,7 @@ from RL_Framework.infra.cost_model.model import (
     RequestInfo,
     RolloutClusterConfig,
     TrainParallelConfig,
+    representative_global_batch,
 )
 from RL_Framework.infra.cost_model.optimizer import (
     OptimizationResult,
@@ -23,6 +24,51 @@ from RL_Framework.infra.cost_model.optimizer import (
 from RL_Framework.infra.cost_model.simulator_adapters import HybridSimulatorCostModel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CoreRuntimeCapabilities:
+    """Fixed Core layout on the already initialized physical ranks.
+
+    Hybrid replicas use a separate process group and do not enlarge this rank
+    set. No capability is supplied to startup GRP, which may choose its size.
+    """
+    world_size: int
+    tp: int
+    pp: int
+    cp: int
+    ep: int
+    dp: int
+    rebuild_tp_dp: bool = field(default=False, init=False)
+
+    @classmethod
+    def from_engine(cls, engine):
+        world = getattr(engine, "world_size", None)
+        if not isinstance(world, int) or world < 1:
+            return None
+        getter = getattr(engine, "get_parallel_state", None)
+        state = getter() if callable(getter) else {}
+        dimensions = {axis: int(state.get(f"train_{axis}",
+            getattr(engine, f"train_{axis}_size", 1))) for axis in ("tp", "pp", "cp", "ep", "dp")}
+        return cls(world_size=world, **dimensions)
+
+    def incompatibility(self, plan):
+        topology = plan.train_config
+        if int(plan.train_gpus) != self.world_size:
+            return "physical_core_rank_set_changed"
+        for axis in ("pp", "cp", "ep"):
+            if int(getattr(topology, axis, 1)) != getattr(self, axis):
+                return f"core_{axis}_rebuild_unsupported"
+        if not self.rebuild_tp_dp and (int(topology.tp) != self.tp
+                or int(topology.dp) * int(getattr(topology, "ep", 1)) != self.dp):
+            return "core_tp_dp_rebuild_unsupported"
+        return ""
+
+    def to_dict(self):
+        return {"physical_rank_count": self.world_size, "tp": self.tp, "pp": self.pp,
+            "cp": self.cp, "ep": self.ep, "dp": self.dp,
+            "rebuild_tp_dp": self.rebuild_tp_dp,
+            "physical_rank_resize": False, "source": "initialized_training_engine"}
 
 
 @dataclass
@@ -188,11 +234,19 @@ class PlannerDecision:
     trigger: str = ""
     runtime_metrics: RuntimeResourceMetrics | None = None
     elastic_hybrid_signal: ElasticHybridSignal | None = None
+    # None preserves legacy hand-constructed decisions. Planner-produced
+    # decisions explicitly distinguish full repartition from EHP adjustment.
+    resource_should_reconfigure: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "step": self.step,
             "should_reconfigure": self.should_reconfigure,
+            "resource_should_reconfigure": self.resource_should_reconfigure,
+            "elastic_should_adjust": bool(
+                self.elastic_hybrid_signal is not None
+                and self.elastic_hybrid_signal.should_adjust
+            ),
             "reason": self.reason,
             "trigger": self.trigger,
             "num_requests": self.num_requests,
@@ -316,6 +370,7 @@ class GlobalResourcePlanner:
             1, int(elastic_hybrid_signal_ttl_steps)
         )
         self.verbose = verbose
+        self.runtime_capabilities: CoreRuntimeCapabilities | None = None
 
         self.optimizer = TwoLevelNestedOptimizer(
             cost_model=evaluator,
@@ -523,6 +578,7 @@ class GlobalResourcePlanner:
                     num_requests=len(self._history),
                     trigger="warmup",
                     runtime_metrics=runtime_metrics,
+                    resource_should_reconfigure=False,
                 )
             )
 
@@ -537,6 +593,7 @@ class GlobalResourcePlanner:
                     num_requests=len(self._history),
                     trigger=trigger,
                     runtime_metrics=runtime_metrics,
+                    resource_should_reconfigure=False,
                 )
             )
         if trigger == "interval_skip":
@@ -549,6 +606,7 @@ class GlobalResourcePlanner:
                     num_requests=len(self._history),
                     trigger=trigger,
                     runtime_metrics=runtime_metrics,
+                    resource_should_reconfigure=False,
                 )
             )
         if len(self._history) < self.min_history_size:
@@ -561,10 +619,12 @@ class GlobalResourcePlanner:
                     num_requests=len(self._history),
                     trigger=trigger,
                     runtime_metrics=runtime_metrics,
+                    resource_should_reconfigure=False,
                 )
             )
 
-        current = self._build_current_plan(config, self._history)
+        workload = representative_global_batch(self._history, int(config.batch_size))
+        current = self._build_current_plan(config, workload)
         forced_rollout_tp = self._forced_rollout_tp_list(config)
         forced_train = self._forced_train_config(
             config,
@@ -578,7 +638,7 @@ class GlobalResourcePlanner:
         forced_candidate = forced_rollout_tp is not None or forced_train is not None
         result = self.optimizer.optimize(
             n_total_gpus=self.n_total_gpus,
-            requests=list(self._history),
+            requests=workload,
             B_global=config.batch_size,
             allowed_train_tp=self.allowed_train_tp,
             allowed_train_ep=self.allowed_train_ep,
@@ -612,6 +672,7 @@ class GlobalResourcePlanner:
                     num_requests=len(self._history),
                     trigger=trigger,
                     runtime_metrics=runtime_metrics,
+                    resource_should_reconfigure=False,
                 )
             )
 
@@ -619,12 +680,12 @@ class GlobalResourcePlanner:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
             forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
                 forced_rollout,
-                list(self._history),
+                workload,
             )
             forced_train_time = current.t_train
             forced_train_details = current.metadata.get("training", {})
             if forced_train is not None:
-                sequence_lengths = [r.total_length for r in self._history] or [1024]
+                sequence_lengths = [r.total_length for r in workload] or [1024]
                 forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                     forced_train,
                     config.batch_size,
@@ -649,7 +710,7 @@ class GlobalResourcePlanner:
                 },
             )
         elif forced_train is not None:
-            sequence_lengths = [r.total_length for r in self._history] or [1024]
+            sequence_lengths = [r.total_length for r in workload] or [1024]
             forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                 forced_train,
                 config.batch_size,
@@ -669,6 +730,42 @@ class GlobalResourcePlanner:
                 },
             )
 
+        # Keep the unconstrained capacity recommendation as EHP demand, while
+        # selecting Core/rollout layouts that the live backend can execute.
+        # Startup has no live capabilities and retains the full 4/8/... search.
+        elastic_candidate = candidate
+        capabilities = self.runtime_capabilities
+        rejected = capabilities.incompatibility(candidate) if capabilities is not None else ""
+        if rejected:
+            unconstrained = candidate.to_dict()
+            if not forced_candidate:
+                feasible = self.optimizer.optimize(
+                    n_total_gpus=self.n_total_gpus, requests=workload,
+                    B_global=config.batch_size,
+                    allowed_train_tp=(self.allowed_train_tp if capabilities.rebuild_tp_dp else [capabilities.tp]),
+                    allowed_train_ep=[capabilities.ep], allowed_train_pp=[capabilities.pp],
+                    micro_batch_sizes=self.micro_batch_sizes,
+                    fixed_train_gpus=capabilities.world_size,
+                    allocation_granularity_gpus=self.allocation_granularity_gpus,
+                    min_train_gpus=self.min_train_gpus, min_rollout_gpus=self.min_rollout_gpus,
+                    rollout_node_tp_pattern=list(getattr(config.global_resource_planner,
+                        "rollout_node_tp_pattern", []) or []),
+                    train_cp_size=capabilities.cp,
+                    dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)))
+                candidate = self._plan_from_result(feasible, config) or current
+                result = feasible
+            else:
+                # Forced test commands also cannot authorize inventing ranks.
+                candidate = current
+            candidate.metadata["runtime_candidate_filter"] = {
+                "reason": rejected, "capabilities": capabilities.to_dict(),
+                "unconstrained_candidate": unconstrained,
+                "elastic_demand_preserved": True}
+        if capabilities is not None:
+            candidate.metadata["runtime_core_capabilities"] = capabilities.to_dict()
+        candidate.metadata["workload"] = {
+            "global_batch_size": int(config.batch_size), "history_size": len(self._history),
+            "representative_requests": len(workload), "selection": "deterministic_length_quantiles"}
         raw_gain = current.t_global - candidate.t_global
         net_gain = raw_gain - self.reconfiguration_cost_s
         gain_ratio = raw_gain / max(current.t_global, 1e-6)
@@ -681,7 +778,7 @@ class GlobalResourcePlanner:
             step=step,
             config=config,
             current=current,
-            candidate=candidate,
+            candidate=elastic_candidate,
             runtime_metrics=runtime_metrics,
         )
         elastic_adjust = bool(
@@ -692,6 +789,7 @@ class GlobalResourcePlanner:
         )
         resource_should = (
             (not same_plan or force_runtime_reconfigure)
+            and not (rejected and forced_candidate)
             and (
                 forced_candidate
                 or force_runtime_reconfigure
@@ -725,12 +823,16 @@ class GlobalResourcePlanner:
             trigger=trigger,
             runtime_metrics=runtime_metrics,
             elastic_hybrid_signal=elastic_signal,
+            resource_should_reconfigure=resource_should,
         )
-        if should:
+        if resource_should:
             self._active_plan = candidate
-            self._last_replan_step = int(step)
-        elif self._active_plan is None:
+        else:
+            # An EHP join/release does not apply the rejected candidate's
+            # training topology or rollout TP layout.
             self._active_plan = current
+        if should:
+            self._last_replan_step = int(step)
         self._mark_rejected_trigger_observed(trigger, runtime_metrics)
         return self._remember(decision)
 
@@ -1021,6 +1123,8 @@ class GlobalResourcePlanner:
         plan: GlobalResourcePlan,
         config: AsyncRLConfig,
     ) -> None:
+        preserve_slots = (config.train_gpus == plan.train_gpus
+                          and config.rollout_gpus == plan.rollout_gpus)
         config.n_total_gpus = plan.n_total_gpus
         config.train_gpus = plan.train_gpus
         config.rollout_gpus = plan.rollout_gpus
@@ -1039,6 +1143,13 @@ class GlobalResourcePlanner:
         hetero.enabled = True
         hetero.total_gpus = plan.rollout_gpus
         host_gpu_pools = self._rollout_host_gpu_pools(config, plan.rollout_gpus)
+        if preserve_slots and hetero.instances:
+            observed: dict[str, set[int]] = {}
+            for instance in hetero.instances:
+                observed.setdefault(instance.host or hetero.vllm_host, set()).update(instance.gpus)
+            # Repartition the actual rollout pool, excluding the fixed Core GPUs.
+            if sum(map(len, observed.values())) == plan.rollout_gpus:
+                host_gpu_pools = [(host, sorted(gpus)) for host, gpus in observed.items()]
         if host_gpu_pools:
             hetero.available_gpus = sorted(
                 {gpu for _, gpus in host_gpu_pools for gpu in gpus}
@@ -1142,6 +1253,7 @@ class GlobalResourcePlanner:
         config: AsyncRLConfig,
         requests: list[RequestInfo],
     ) -> GlobalResourcePlan:
+        requests = representative_global_batch(requests, int(config.batch_size))
         train = TrainParallelConfig(
             tp=config.train_tp_size,
             ep=max(1, int(getattr(config, "train_ep_size", 1) or 1)),
