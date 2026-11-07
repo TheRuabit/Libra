@@ -22,10 +22,7 @@ try:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 except ImportError:
     from vllm.utils import FlexibleArgumentParser
-try:
-    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
-except ImportError:
-    cli_env_setup = api_server.cli_env_setup
+
 from RL_Framework.infra.sync.prefix_cache_reset import (
     install_checked_prefix_cache_reset, reset_prefix_cache_verified,
 )
@@ -196,6 +193,10 @@ api_server.build_app = build_app_with_reload_routes
 
 
 if __name__ == "__main__":
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+    except ImportError:
+        cli_env_setup = api_server.cli_env_setup
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI server with Libra hot weight reload support."
