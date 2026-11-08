@@ -19,6 +19,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_collective_weight_export.py \
   tests/test_cmlfq_scheduler.py \
   tests/test_cmlfq_cost_scheduler.py \
+  tests/test_cmlfq_kv_cost_scheduler.py \
   tests/test_cost_model_units.py \
   tests/test_cmlfq_rebind_state.py \
   tests/test_hetero_cmlfq_integration.py \
